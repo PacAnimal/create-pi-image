@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+_scriptname="create_pi_image"
+set -u
+set -e
+
+
+# intro
+cat >&2 <<-EOF
+$_scriptname
+
+This script produces compressed Raspberry Pi (RPI) images from an sd card device
+Currently, only clean Raspbian images are supported. No NOOBS.
+
+EOF
+
+
+# options?
+if (( $# > 1 )); then
+	echo "Usage: $_scriptname [device]" >&2
+	exit 1
+fi
+
+
+# steps
+color_reset="$(tput sgr0)"
+color_white="${color_reset}$(tput bold)$(tput setaf 7)"
+color_green="${color_reset}$(tput setaf 2)"
+color_yellow="${color_reset}$(tput bold)$(tput setaf 3)"
+function step { echo "${color_white}==> ${color_green}$*${color_reset}" >&2; }
+function yell { echo "${color_yellow}$*${color_reset}" >&2; }
+
+
+# select device
+step "Select device"
+while true; do
+	echo
+	if (( $# )); then
+		dev=$1
+		shift
+	else
+		read -r -p 'Please enter device name (sdb, sdc, or similar): ' dev
+	fi
+	[[ -n "$dev" ]] || continue
+	dev=$(realpath "/dev/${dev}" 2>/dev/null || :)
+	if [[ "$dev" != "/dev" ]]; then
+		if [[ -e "$dev" ]]; then
+			if ! [[ -e "${dev}1" ]] || ! [[ -e "${dev}2" ]] || [[ -e "${dev}3" ]]; then
+				echo "This does not look like a clean Raspbian block device: $dev" >&2
+				echo "Tip: Do not enter sdb1, just sdb" >&2
+				continue
+			else
+				cat >&2 <<-EOF
+
+					WARNING: This will alter the contents of the device.
+					Make sure it's not your boot device, or anything else stupid.
+
+				EOF
+				read -r -p "Use '$dev'? [y/N] " answer
+				case "${answer,,}" in
+					y|yes) break ;;
+				esac
+			fi
+		else
+			echo "No such device: $dev" >&2
+		fi
+	fi
+done
+filename="image-$(date +'%Y_%m_%d')"
+echo -e "\nWill produce RPI image from: $dev"
+echo -e "Output: ${filename}.zip\n"
+
+
+# mount point, cache, and cleanup
+tmpdir="${HOME}/.config/$_scriptname"
+mkdir -p "$tmpdir"
+mount=$(mktemp -d)
+function cleanup
+{
+	umount "$mount" 2>/dev/null || :
+	rmdir "$mount"
+	find "$tmpdir" -mindepth 1 -depth -delete
+}
+trap cleanup EXIT
+
+
+# tune-up
+step "Check root file system"
+e2fsck -f -y "${dev}2" || :
+
+
+# how to clean
+function remove { rm -r "$1"; echo "Removed: ${1#$mount}"; }
+function wipe { >"$1"; echo "Wiped:   ${1#$mount}"; }
+
+
+# user files
+step "Erasing user files"
+mount "${dev}2" "$mount"
+while read -r -d $'\0' file; do
+	case "$file" in
+		*"/.bash_history") wipe "$file" ;;
+		*"/.vim") remove "$file" ;;
+		*"/.nano") remove "$file" ;;
+		*"/.lesshst") remove "$file" ;;
+		*"/.wget-hsts") remove "$file" ;;
+	esac
+done < <(
+	find "${mount}/root" -mindepth 1 -depth -print0
+	find "${mount}/home" -mindepth 2 -depth -print0
+)
+umount "$mount"
+
+
+# logs
+step "Erasing logs"
+mount "${dev}2" "$mount"
+find "${mount}/var/log" -type f -print0 | while read -r -d $'\0' file; do
+	if [[ "$file" =~ \.(gz|xz|tgz|old|[0-9]+)$ ]]; then
+		remove "$file"
+	else
+		wipe "$file"
+	fi
+done
+umount "$mount"
+
+
+# tmp
+step "Erasing temporary files"
+mount "${dev}2" "$mount"
+for dir in "${mount}/tmp" "${mount}/var/tmp" "${mount}/var/cache/apt/archives" "${mount}/var/lib/apt/lists"; do
+	[[ -d "$dir" ]] || continue
+	find "$dir" -mindepth 1 -depth -delete -print0 | while read -r -d $'\0' file; do
+		echo "Removed: ${file#$mount}"
+	done
+done
+umount "$mount"
+
+
+# special cases
+step "Erasing some more stuff"
+mount "${dev}2" "$mount"
+if [[ -e "${mount}/opt/vc/src/hello_pi/hello_video/test.h264" ]]; then
+	wipe "${mount}/opt/vc/src/hello_pi/hello_video/test.h264"
+fi
+wipe "${mount}/etc/resolv.conf"
+umount "$mount"
+
+
+# defrag
+step "Defragment root file system"
+mount "${dev}2" "$mount"
+e4defrag "${dev}2" >/dev/null
+umount "$mount"
+
+
+# re-tune-up
+step "Re-check root file system"
+e2fsck -f -y "${dev}2"
+
+
+# resize!
+step "Resize root file system"
+resize2fs -M "${dev}2"
+
+
+# determine sizes
+step "Resize root partition"
+root_count=""
+root_size=""
+root_begin=""
+root_sector=""
+while read -r line; do
+	case "${line,,}" in
+		"block count: "*) root_count=${line##* } ;;
+		"block size: "*) root_size=${line##* } ;;
+	esac
+done < <(dumpe2fs -h "${dev}2")
+while read -r line; do
+	case "${line,,}" in
+		"${dev}2 "*) root_begin=$(awk '{print $2}' <<<"$line") ;;
+		"units: sectors of "*) root_sector=$(awk '{print $1}' <<< "${line##* = }") ;;
+	esac
+done < <(fdisk -l "${dev}")
+if [[ -z "$root_count" ]] || [[ -z "$root_size" ]] || [[ -z "$root_begin" ]] || [[ -z "$root_sector" ]]; then
+	echo "Unable to determine root file system size :(" >&2
+	exit 1
+fi
+root_end=$((root_begin + (root_count*root_size/root_sector) - 1))
+echo "Root FS block count:             $root_count"
+echo "Root FS block size:              $root_size"
+echo "Root FS begins at:               $root_begin"
+echo "Root FS sector size:             $root_sector"
+echo "Root FS partition should end at: $root_end"
+parted "${dev}" unit s resizepart 2 "${root_end}s" Yes
+sync
+
+
+# re-tune
+step "Re-check root file system"
+e2fsck -f -y "${dev}2"
+
+
+# auto expanding
+step "Re-enabling auto expanding root file system"
+mount "${dev}2" "$mount"
+if ! [[ -e "${mount}/usr/lib/raspi-config/init_resize.sh" ]]; then
+	echo "No idea how to re-enable the auto expand on this system :(" >&2
+	echo "Please update the script?" >&2
+	exit 1
+fi
+cat >"${mount}/usr/local/sbin/auto-expand-fs" <<-"EOF"
+#!/usr/bin/env bash
+root_dev=$(/bin/findmnt / -o source -n)
+/sbin/resize2fs "$root_dev"
+/bin/rm -v "/usr/local/sbin/auto-expand-fs" "/etc/cron.d/auto-expand-fs"
+EOF
+cat >"${mount}/etc/cron.d/auto-expand-fs" <<-"EOF"
+@reboot root /bin/bash /usr/local/sbin/auto-expand-fs
+EOF
+umount "$mount"
+mount "${dev}1" "$mount"
+cmdline=$(<"${mount}/cmdline.txt")
+if [[ " $cmdline" != *" init=" ]]; then
+	cmdline+=" init=/usr/lib/raspi-config/init_resize.sh"
+	printf '%s\n' "$cmdline" >"${mount}/cmdline.txt"
+fi
+umount "$mount"
+
+
+# zero fill
+step "Zero-fill free space"
+for i in 1 2; do
+	mount "${dev}$i" "$mount"
+	cat /dev/zero >"${mount}/${_scriptname}-zero" 2>/dev/null || :
+	rm "${mount}/${_scriptname}-zero"
+	umount "$mount"
+done
+sync
+
+
+# create image file
+step "Create image file"
+dd if="${dev}" of="${tmpdir}/${filename}.img" bs="$root_sector" count="$((root_end+1))"
+
+
+# the user can carry on now...
+yell "We're done creating your image file now."
+yell "You may now remove the SD card and test it in an RPI, or eat it, while I compress this thing..."
+
+
+# compress it
+7z a -tzip -mx=9 "${filename}.zip" "${tmpdir}/${filename}.img"
+
+
+
+# vim: tabstop=4:softtabstop=4:shiftwidth=4:noexpandtab
