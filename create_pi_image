@@ -20,7 +20,6 @@ set -e
 
 # intro
 cat >&2 <<-EOF
-$_scriptname
 
 This script produces compressed Raspberry Pi (RPI) images from an sd card device
 Currently, only clean Raspbian images are supported. No NOOBS.
@@ -29,6 +28,25 @@ EOF
 
 
 # options?
+assume_yes=false
+hostname=""
+OPTIND=1
+while getopts ":h:y" opt; do
+	case "$opt" in
+		h) hostname="$OPTARG" ;;
+		y) assume_yes=true ;;
+		[?])
+			echo "Unknown option -${OPTARG}" >&2
+			exit 1
+		;;
+		:)
+			echo "Option -${OPTARG} requires an argument" >&2
+			exit 1
+		;;
+	esac
+done
+shift $((OPTIND-1))
+if [[ "${1:-}" = "--" ]]; then shift; fi
 if (( $# > 1 )); then
 	echo "Usage: $_scriptname [device]" >&2
 	exit 1
@@ -44,6 +62,25 @@ function step { echo "${color_white}==> ${color_green}$*${color_reset}" >&2; }
 function yell { echo "${color_yellow}$*${color_reset}" >&2; }
 
 
+# check required tools
+requirements=(
+	dd
+	7z
+	resize2fs
+	dumpe2fs
+	e4defrag
+	e2fsck
+)
+missing=false
+for req in "${requirements[@]}"; do
+	if ! type "$req" >/dev/null 2>&1; then
+		echo "Required command missing: $req" >&2
+		missing=true
+	fi
+done
+! $missing || exit 1
+
+
 # select device
 step "Select device"
 while true; do
@@ -52,9 +89,11 @@ while true; do
 		dev=$1
 		shift
 	else
+		assume_yes=false
 		read -r -p 'Please enter device name (sdb, sdc, or similar): ' dev
 	fi
 	[[ -n "$dev" ]] || continue
+	orig_dev="$dev"
 	dev=$(realpath "/dev/${dev}" 2>/dev/null || :)
 	if [[ "$dev" != "/dev" ]]; then
 		if [[ -e "$dev" ]]; then
@@ -62,6 +101,9 @@ while true; do
 				echo "This does not look like a clean Raspbian block device: $dev" >&2
 				echo "Tip: Do not enter sdb1, just sdb" >&2
 				continue
+			elif $assume_yes; then
+				echo "Not asking you to make sure $dev is correct, as '-y' was specified." >&2
+				break
 			else
 				cat >&2 <<-EOF
 
@@ -75,7 +117,7 @@ while true; do
 				esac
 			fi
 		else
-			echo "No such device: $dev" >&2
+			echo "No such device: $orig_dev" >&2
 		fi
 	fi
 done
@@ -219,26 +261,35 @@ step "Re-enabling auto expanding root file system"
 mount "${dev}2" "$mount"
 if ! [[ -e "${mount}/usr/lib/raspi-config/init_resize.sh" ]]; then
 	echo "No idea how to re-enable the auto expand on this system :(" >&2
-	echo "Please update the script?" >&2
-	exit 1
+else
+	cat >"${mount}/usr/local/sbin/auto-expand-fs" <<-"EOF"
+		#!/usr/bin/env bash
+		root_dev=$(/bin/findmnt / -o source -n)
+		/sbin/resize2fs "$root_dev"
+		/bin/rm -v "/usr/local/sbin/auto-expand-fs" "/etc/cron.d/auto-expand-fs"
+	EOF
+	cat >"${mount}/etc/cron.d/auto-expand-fs" <<-"EOF"
+		@reboot root /bin/bash /usr/local/sbin/auto-expand-fs
+	EOF
+	umount "$mount"
+	mount "${dev}1" "$mount"
+	cmdline=$(<"${mount}/cmdline.txt")
+	if [[ " $cmdline" != *" init=" ]]; then
+		cmdline+=" init=/usr/lib/raspi-config/init_resize.sh"
+		printf '%s\n' "$cmdline" >"${mount}/cmdline.txt"
+	fi
 fi
-cat >"${mount}/usr/local/sbin/auto-expand-fs" <<-"EOF"
-#!/usr/bin/env bash
-root_dev=$(/bin/findmnt / -o source -n)
-/sbin/resize2fs "$root_dev"
-/bin/rm -v "/usr/local/sbin/auto-expand-fs" "/etc/cron.d/auto-expand-fs"
-EOF
-cat >"${mount}/etc/cron.d/auto-expand-fs" <<-"EOF"
-@reboot root /bin/bash /usr/local/sbin/auto-expand-fs
-EOF
 umount "$mount"
-mount "${dev}1" "$mount"
-cmdline=$(<"${mount}/cmdline.txt")
-if [[ " $cmdline" != *" init=" ]]; then
-	cmdline+=" init=/usr/lib/raspi-config/init_resize.sh"
-	printf '%s\n' "$cmdline" >"${mount}/cmdline.txt"
+
+
+# reset hostname?
+if [[ -n "$hostname" ]]; then
+	step "Resetting hostname"
+	mount "${dev}2" "$mount"
+	old="$(<"${mount}/etc/hostname")"
+	sed -i "s/${old}/${hostname}/g" "${mount}/etc/hostname" "${mount}/etc/hosts"
+	umount "$mount"
 fi
-umount "$mount"
 
 
 # zero fill
